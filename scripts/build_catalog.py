@@ -100,7 +100,7 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
 
 def collect_modules() -> dict[str, dict[str, Any]]:
     modules: dict[str, dict[str, Any]] = {}
-    tasks = []
+    tasks = {}
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         for trust in TRUST_TIERS:
@@ -109,11 +109,20 @@ def collect_modules() -> dict[str, dict[str, Any]]:
                 continue
                 
             for entry_file in sorted(tier_dir.glob("*.json")):
-                tasks.append(executor.submit(process_module, entry_file))
+                future = executor.submit(process_module, entry_file)
+                tasks[future] = entry_file
                 
+        errors = []
         for future in concurrent.futures.as_completed(tasks):
-            module_id, mod_payload = future.result()
-            modules[module_id] = mod_payload
+            entry_file = tasks[future]
+            try:
+                module_id, mod_payload = future.result()
+                modules[module_id] = mod_payload
+            except Exception as e:
+                errors.append(f"  - {entry_file.relative_to(ROOT)}: {e}")
+                
+    if errors:
+        raise RuntimeError("Failed to collect all modules due to the following errors:\n" + "\n".join(errors))
             
     return modules
 
@@ -129,6 +138,9 @@ def generate_checksums(files: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 def build() -> None:
+    import shutil
+    if DIST_ROOT.exists():
+        shutil.rmtree(DIST_ROOT)
     DIST_ROOT.mkdir(parents=True, exist_ok=True)
     V1_ROOT.mkdir(parents=True, exist_ok=True)
     SCHEMA_OUT.mkdir(parents=True, exist_ok=True)
