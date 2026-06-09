@@ -83,9 +83,13 @@ def fetch_npm_meta(package_name: str) -> dict:
                     raise ValueError("NPM registry response is not a JSON object")
                 return payload
         except urllib.error.HTTPError as exc:
-            if exc.code == 404:
+            if exc.code in (400, 401, 403, 404):
                 raise RuntimeError(
-                    f"Package '{package_name}' was not found on NPM (404)."
+                    f"Package '{package_name}' fetch failed with status {exc.code}."
+                ) from exc
+            if 400 <= exc.code < 500 and exc.code not in (408, 429):
+                raise RuntimeError(
+                    f"Package '{package_name}' fetch failed with status {exc.code}."
                 ) from exc
             last_error = exc
         except (urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
@@ -115,7 +119,10 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
     npm_data = fetch_npm_meta(package_name)
     
     versions_out = {}
-    for ver, v_data in (npm_data.get("versions") or {}).items():
+    versions_raw = npm_data.get("versions")
+    if not isinstance(versions_raw, dict):
+        versions_raw = {}
+    for ver, v_data in versions_raw.items():
         if not isinstance(v_data, dict):
             continue
         choysum_meta = v_data.get("choysum")
@@ -193,7 +200,7 @@ def collect_modules() -> dict[str, dict[str, Any]]:
     return modules
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def generate_checksums(files: list[Path]) -> str:
     lines = []
