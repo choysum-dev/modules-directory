@@ -1,0 +1,10 @@
+# Default Owners
+* @choysum-dev/core
+
+# Restrict directory permissions: Official and Verified tiers require elevated reviews
+/modules/official/ @choysum-dev/core @choysum-dev/catalog-maintainers
+/modules/verified/ @choysum-dev/catalog-maintainers
+
+# CI / Infrastructure
+/.github/ @choysum-dev/infra
+/scripts/ @choysum-dev/infra

@@ -1,0 +1,29 @@
+name: Module Submission Bug / Issue
+description: Report an issue regarding module directory submission, syncing or build failure
+title: "[Submission Issue] "
+labels: ["triage", "submission"]
+body:
+  - type: textarea
+    id: details
+    attributes:
+      label: Description
+      description: Describe the problem encountered during your module submission or automated PR.
+    validations:
+      required: true
+  - type: input
+    id: package_name
+    attributes:
+      label: NPM Package Name
+      description: The npm package coordinate (e.g. @acme/choysum-sale)
+    validations:
+      required: true
+  - type: dropdown
+    id: trust_tier
+    attributes:
+      label: Targeted Trust Tier
+      options:
+        - community
+        - verified
+        - official
+    validations:
+      required: true
