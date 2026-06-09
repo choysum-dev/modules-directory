@@ -1,0 +1,15 @@
+/v1/index.json
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=300, stale-while-revalidate=3600
+/v1/index.*.json
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=31536000, immutable
+/v1/meta.json
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=60, stale-while-revalidate=300
+/v1/schema/*
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=86400
+/v1/checksums.txt
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=300
