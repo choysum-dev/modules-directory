@@ -11,6 +11,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      CHOYSUM_NPM_FETCH_TIMEOUT_SECONDS: "10"
+      CHOYSUM_NPM_FETCH_MAX_RETRIES: "3"
+      CHOYSUM_NPM_FETCH_BACKOFF_SECONDS: "1.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
