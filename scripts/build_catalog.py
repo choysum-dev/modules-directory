@@ -42,8 +42,8 @@ def fetch_npm_meta(package_name: str) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             return json.loads(response.read().decode('utf-8'))
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Failed to fetch {package_name} from NPM: {e}")
+    except (urllib.error.URLError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"Failed to fetch or parse {package_name} from NPM: {e}")
 
 def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
     entry = load_json(entry_file)
@@ -71,11 +71,19 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
         # Tarball redirect format matching the Phase 4.3 specification
         tarball_url = f"https://registry.choysum.dev/v1/tarballs/{package_name}/{ver}.tgz"
         
+        depends = choysum_meta.get("depends")
+        if not isinstance(depends, list):
+            depends = []
+
+        peer_deps = v_data.get("peerDependencies")
+        if not isinstance(peer_deps, dict):
+            peer_deps = {}
+
         v_entry = {
             "tarball": tarball_url,
             "integrity": dist_meta.get("integrity", ""),
-            "depends": choysum_meta.get("depends", []),
-            "peerDependencies": v_data.get("peerDependencies") or {}
+            "depends": depends,
+            "peerDependencies": peer_deps
         }
         if "compatibility" in choysum_meta:
             v_entry["compatibility"] = choysum_meta["compatibility"]
