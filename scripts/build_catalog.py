@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 import concurrent.futures
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,7 +36,6 @@ def load_json(path: Path) -> Any:
         return json.load(handle)
 
 def fetch_npm_meta(package_name: str) -> dict:
-    import urllib.parse
     quoted_name = urllib.parse.quote(package_name, safe="@")
     url = f"https://registry.npmjs.org/{quoted_name}"
     req = urllib.request.Request(url, headers={"User-Agent": "Choysum-Catalog-Builder/1.0"})
