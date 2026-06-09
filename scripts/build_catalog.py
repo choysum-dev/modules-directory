@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import http.client
 import hashlib
 import json
 import os
 import shutil
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -83,16 +85,20 @@ def fetch_npm_meta(package_name: str) -> dict:
                     raise ValueError("NPM registry response is not a JSON object")
                 return payload
         except urllib.error.HTTPError as exc:
-            if exc.code in (400, 401, 403, 404):
-                raise RuntimeError(
-                    f"Package '{package_name}' fetch failed with status {exc.code}."
-                ) from exc
             if 400 <= exc.code < 500 and exc.code not in (408, 429):
                 raise RuntimeError(
                     f"Package '{package_name}' fetch failed with status {exc.code}."
                 ) from exc
             last_error = exc
-        except (urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            socket.timeout,
+            TimeoutError,
+            ConnectionError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
             last_error = exc
 
         if attempt < NPM_FETCH_MAX_RETRIES:
