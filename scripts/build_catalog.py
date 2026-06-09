@@ -35,34 +35,47 @@ def load_json(path: Path) -> Any:
         return json.load(handle)
 
 def fetch_npm_meta(package_name: str) -> dict:
-    url = f"https://registry.npmjs.org/{package_name}"
+    import urllib.parse
+    quoted_name = urllib.parse.quote(package_name, safe="@")
+    url = f"https://registry.npmjs.org/{quoted_name}"
     req = urllib.request.Request(url, headers={"User-Agent": "Choysum-Catalog-Builder/1.0"})
     try:
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             return json.loads(response.read().decode('utf-8'))
     except urllib.error.URLError as e:
         raise RuntimeError(f"Failed to fetch {package_name} from NPM: {e}")
 
 def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
     entry = load_json(entry_file)
+    if not isinstance(entry, dict):
+        raise ValueError(f"Catalog entry must be a JSON object: {entry_file}")
     module_id = entry_file.stem
     package_name = entry.get("package")
+    if not isinstance(package_name, str) or not package_name.strip():
+        raise ValueError(f"Invalid or missing 'package' field in {entry_file}")
     
     print(f"Fetching NPM metadata for {package_name} (module: {module_id})...")
     npm_data = fetch_npm_meta(package_name)
     
     versions_out = {}
-    for ver, v_data in npm_data.get("versions", {}).items():
-        choysum_meta = v_data.get("choysum", {})
+    for ver, v_data in (npm_data.get("versions") or {}).items():
+        if not isinstance(v_data, dict):
+            continue
+        choysum_meta = v_data.get("choysum")
+        if not isinstance(choysum_meta, dict):
+            choysum_meta = {}
+        dist_meta = v_data.get("dist")
+        if not isinstance(dist_meta, dict):
+            dist_meta = {}
         
         # Tarball redirect format matching the Phase 4.3 specification
         tarball_url = f"https://registry.choysum.dev/v1/tarballs/{package_name}/{ver}.tgz"
         
         v_entry = {
             "tarball": tarball_url,
-            "integrity": v_data.get("dist", {}).get("integrity", ""),
+            "integrity": dist_meta.get("integrity", ""),
             "depends": choysum_meta.get("depends", []),
-            "peerDependencies": v_data.get("peerDependencies", {})
+            "peerDependencies": v_data.get("peerDependencies") or {}
         }
         if "compatibility" in choysum_meta:
             v_entry["compatibility"] = choysum_meta["compatibility"]
