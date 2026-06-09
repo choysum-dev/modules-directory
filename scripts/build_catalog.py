@@ -5,15 +5,45 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
+import os
+import shutil
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import concurrent.futures
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+def read_int_env(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
+def read_float_env(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number, got {raw!r}") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TRUST_TIERS = ("official", "verified", "community")
@@ -22,6 +52,9 @@ DIST_ROOT = ROOT / "dist"
 V1_ROOT = DIST_ROOT / "v1"
 SCHEMA_SRC = ROOT / "schemas"
 SCHEMA_OUT = V1_ROOT / "schema"
+NPM_FETCH_TIMEOUT_SECONDS = read_int_env("CHOYSUM_NPM_FETCH_TIMEOUT_SECONDS", 10)
+NPM_FETCH_MAX_RETRIES = read_int_env("CHOYSUM_NPM_FETCH_MAX_RETRIES", 3)
+NPM_FETCH_BACKOFF_SECONDS = read_float_env("CHOYSUM_NPM_FETCH_BACKOFF_SECONDS", 1.0)
 
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -35,15 +68,39 @@ def load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
+
 def fetch_npm_meta(package_name: str) -> dict:
     quoted_name = urllib.parse.quote(package_name, safe="@")
     url = f"https://registry.npmjs.org/{quoted_name}"
     req = urllib.request.Request(url, headers={"User-Agent": "Choysum-Catalog-Builder/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except (urllib.error.URLError, json.JSONDecodeError) as e:
-        raise RuntimeError(f"Failed to fetch or parse {package_name} from NPM: {e}")
+    last_error: Exception | None = None
+
+    for attempt in range(1, NPM_FETCH_MAX_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=NPM_FETCH_TIMEOUT_SECONDS) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("NPM registry response is not a JSON object")
+                return payload
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise RuntimeError(
+                    f"Package '{package_name}' was not found on NPM (404)."
+                ) from exc
+            last_error = exc
+        except (urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+
+        if attempt < NPM_FETCH_MAX_RETRIES:
+            backoff_seconds = NPM_FETCH_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            time.sleep(backoff_seconds)
+
+    if last_error is None:
+        raise RuntimeError(f"Failed to fetch metadata for {package_name}: unknown error")
+    raise RuntimeError(
+        f"Failed to fetch or parse {package_name} from NPM "
+        f"after {NPM_FETCH_MAX_RETRIES} attempts: {last_error}"
+    ) from last_error
 
 def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
     entry = load_json(entry_file)
@@ -100,30 +157,39 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
 
 def collect_modules() -> dict[str, dict[str, Any]]:
     modules: dict[str, dict[str, Any]] = {}
-    tasks = {}
-    
+    module_sources: dict[str, Path] = {}
+    tasks: dict[concurrent.futures.Future[tuple[str, dict[str, Any]]], Path] = {}
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         for trust in TRUST_TIERS:
             tier_dir = CATALOG_ROOT / trust
             if not tier_dir.is_dir():
                 continue
-                
+
             for entry_file in sorted(tier_dir.glob("*.json")):
                 future = executor.submit(process_module, entry_file)
                 tasks[future] = entry_file
-                
-        errors = []
+
+        errors: list[str] = []
         for future in concurrent.futures.as_completed(tasks):
             entry_file = tasks[future]
             try:
                 module_id, mod_payload = future.result()
+                if module_id in modules:
+                    existing_file = module_sources[module_id]
+                    errors.append(
+                        f"  - Duplicate module ID '{module_id}' between "
+                        f"{existing_file.relative_to(ROOT)} and {entry_file.relative_to(ROOT)}"
+                    )
+                    continue
                 modules[module_id] = mod_payload
+                module_sources[module_id] = entry_file
             except Exception as e:
                 errors.append(f"  - {entry_file.relative_to(ROOT)}: {e}")
-                
+
     if errors:
         raise RuntimeError("Failed to collect all modules due to the following errors:\n" + "\n".join(errors))
-            
+
     return modules
 
 def utc_now_iso() -> str:
@@ -138,15 +204,15 @@ def generate_checksums(files: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 def build() -> None:
-    import shutil
+    modules = collect_modules()
+    generated_at = utc_now_iso()
+
     if DIST_ROOT.exists():
         shutil.rmtree(DIST_ROOT)
     DIST_ROOT.mkdir(parents=True, exist_ok=True)
     V1_ROOT.mkdir(parents=True, exist_ok=True)
     SCHEMA_OUT.mkdir(parents=True, exist_ok=True)
 
-    generated_at = utc_now_iso()
-    modules = collect_modules()
     index_payload = {
         "generatedAt": generated_at,
         "modules": modules,
