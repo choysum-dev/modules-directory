@@ -1,0 +1,5 @@
+name = "modules-directory"
+pages_build_output_dir = "dist"
+
+[build]
+command = "python scripts/build_catalog.py"
