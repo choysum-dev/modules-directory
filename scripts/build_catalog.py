@@ -138,7 +138,7 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
 
         v_entry = {
             "tarball": tarball_url,
-            "integrity": dist_meta.get("integrity", ""),
+            "integrity": dist_meta.get("integrity") or "",
             "depends": depends,
             "peerDependencies": peer_deps
         }
@@ -218,7 +218,7 @@ def build() -> None:
         "modules": modules,
         "version": 1,
     }
-    canonical_index = json.dumps(index_payload, sort_keys=True, separators=(",", ":"))
+    canonical_index = json.dumps(index_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     index_hash = hashlib.sha256(canonical_index.encode("utf-8")).hexdigest()
 
     index_path = V1_ROOT / "index.json"
