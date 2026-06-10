@@ -57,6 +57,7 @@ SCHEMA_OUT = V1_ROOT / "schema"
 NPM_FETCH_TIMEOUT_SECONDS = read_int_env("CHOYSUM_NPM_FETCH_TIMEOUT_SECONDS", 10)
 NPM_FETCH_MAX_RETRIES = read_int_env("CHOYSUM_NPM_FETCH_MAX_RETRIES", 3)
 NPM_FETCH_BACKOFF_SECONDS = read_float_env("CHOYSUM_NPM_FETCH_BACKOFF_SECONDS", 1.0)
+BUILD_CONCURRENCY = read_int_env("CHOYSUM_BUILD_CONCURRENCY", 5)
 
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,7 +174,7 @@ def collect_modules() -> dict[str, dict[str, Any]]:
     module_sources: dict[str, Path] = {}
     tasks: dict[concurrent.futures.Future[tuple[str, dict[str, Any]]], Path] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=BUILD_CONCURRENCY) as executor:
         for trust in TRUST_TIERS:
             tier_dir = CATALOG_ROOT / trust
             if not tier_dir.is_dir():
@@ -220,8 +221,12 @@ def build() -> None:
     modules = collect_modules()
     generated_at = utc_now_iso()
 
-    if DIST_ROOT.exists():
+    if DIST_ROOT.is_symlink():
+        DIST_ROOT.unlink()
+    elif DIST_ROOT.exists() and DIST_ROOT.is_dir():
         shutil.rmtree(DIST_ROOT)
+    elif DIST_ROOT.exists():
+        DIST_ROOT.unlink()
     DIST_ROOT.mkdir(parents=True, exist_ok=True)
     V1_ROOT.mkdir(parents=True, exist_ok=True)
     SCHEMA_OUT.mkdir(parents=True, exist_ok=True)
@@ -231,13 +236,13 @@ def build() -> None:
         "modules": modules,
         "version": 1,
     }
-    canonical_index = json.dumps(index_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    canonical_index = json.dumps(index_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
     index_hash = hashlib.sha256(canonical_index.encode("utf-8")).hexdigest()
 
     index_path = V1_ROOT / "index.json"
     index_hashed_path = V1_ROOT / f"index.{index_hash}.json"
-    write_text(index_path, canonical_index + "\n")
-    write_text(index_hashed_path, canonical_index + "\n")
+    write_text(index_path, canonical_index)
+    write_text(index_hashed_path, canonical_index)
 
     meta_payload = {
         "generatedAt": generated_at,
