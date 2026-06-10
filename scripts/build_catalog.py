@@ -80,8 +80,13 @@ def resolve_integrity(dist_meta: dict[str, Any], package_name: str, version: str
 
     shasum = dist_meta.get("shasum")
     if isinstance(shasum, str) and shasum.strip():
+        shasum_str = shasum.strip()
+        if len(shasum_str) != 40:
+            raise ValueError(
+                f"Invalid shasum length for package '{package_name}' version '{version}'"
+            )
         try:
-            digest = bytes.fromhex(shasum.strip())
+            digest = bytes.fromhex(shasum_str)
         except ValueError as exc:
             raise ValueError(
                 f"Invalid shasum hex for package '{package_name}' version '{version}'"
