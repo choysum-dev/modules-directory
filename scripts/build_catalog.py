@@ -241,8 +241,11 @@ def generate_checksums(files: list[Path]) -> str:
     lines = []
     for f in sorted(files):
         rel_path = f"/{f.relative_to(DIST_ROOT).as_posix()}"
-        h = hashlib.sha256(f.read_bytes()).hexdigest()
-        lines.append(f"{h}  {rel_path}")
+        hasher = hashlib.sha256()
+        with f.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                hasher.update(chunk)
+        lines.append(f"{hasher.hexdigest()}  {rel_path}")
     return "\n".join(lines) + "\n"
 
 def build() -> None:
