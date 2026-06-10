@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import http.client
 import hashlib
@@ -70,6 +71,26 @@ def write_json(path: Path, payload: dict) -> None:
 def load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def resolve_integrity(dist_meta: dict[str, Any], package_name: str, version: str) -> str:
+    integrity = dist_meta.get("integrity")
+    if isinstance(integrity, str) and integrity.strip():
+        return integrity
+
+    shasum = dist_meta.get("shasum")
+    if isinstance(shasum, str) and shasum.strip():
+        try:
+            digest = bytes.fromhex(shasum.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid shasum hex for package '{package_name}' version '{version}'"
+            ) from exc
+        return "sha1-" + base64.b64encode(digest).decode("ascii")
+
+    raise ValueError(
+        f"Missing integrity hash for package '{package_name}' version '{version}'"
+    )
 
 
 def fetch_npm_meta(package_name: str) -> dict:
@@ -150,9 +171,11 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
         if not isinstance(peer_deps, dict):
             peer_deps = {}
 
+        integrity = resolve_integrity(dist_meta, package_name, ver)
+
         v_entry = {
             "tarball": tarball_url,
-            "integrity": dist_meta.get("integrity") or "",
+            "integrity": integrity,
             "depends": depends,
             "peerDependencies": peer_deps
         }
@@ -160,6 +183,11 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
             v_entry["compatibility"] = choysum_meta["compatibility"]
             
         versions_out[ver] = v_entry
+
+    if not versions_out:
+        raise ValueError(
+            f"No valid versions found for package '{package_name}' (module: {module_id})"
+        )
         
     return module_id, {
         "moduleId": module_id,
@@ -259,12 +287,15 @@ def build() -> None:
         target.write_text(schema_file.read_text(encoding="utf-8"), encoding="utf-8")
         checksum_files.append(target)
 
-    # Note: _headers and _redirects are managed statically in the Git repository now.
-    # We will copy them to the dist folder so Cloudflare Pages can use them.
-    if (ROOT / "_headers").exists():
-        write_text(DIST_ROOT / "_headers", (ROOT / "_headers").read_text(encoding="utf-8"))
-    if (ROOT / "_redirects").exists():
-        write_text(DIST_ROOT / "_redirects", (ROOT / "_redirects").read_text(encoding="utf-8"))
+    headers_src = ROOT / "_headers"
+    redirects_src = ROOT / "_redirects"
+    if not headers_src.is_file():
+        raise RuntimeError(f"Missing required static file: {headers_src.relative_to(ROOT)}")
+    if not redirects_src.is_file():
+        raise RuntimeError(f"Missing required static file: {redirects_src.relative_to(ROOT)}")
+
+    write_text(DIST_ROOT / "_headers", headers_src.read_text(encoding="utf-8"))
+    write_text(DIST_ROOT / "_redirects", redirects_src.read_text(encoding="utf-8"))
 
     # Finally generate checksums
     checksums_path = V1_ROOT / "checksums.txt"
