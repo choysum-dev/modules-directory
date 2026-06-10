@@ -244,7 +244,7 @@ def utc_now_iso() -> str:
 
 def generate_checksums(files: list[Path]) -> str:
     lines = []
-    for f in sorted(files):
+    for f in sorted(files, key=lambda p: p.relative_to(DIST_ROOT).as_posix()):
         rel_path = f"/{f.relative_to(DIST_ROOT).as_posix()}"
         hasher = hashlib.sha256()
         with f.open("rb") as handle:
