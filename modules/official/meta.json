@@ -1,0 +1,10 @@
+{
+  "$schema": "../../schemas/catalog-entry.schema.json",
+  "package": "@choysum-dev/meta",
+  "trust": "official",
+  "maintainers": [
+    {
+      "github": "choysum-dev"
+    }
+  ]
+}
