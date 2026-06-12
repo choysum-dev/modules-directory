@@ -14,7 +14,7 @@ from typing import Any
 TRUST_TIERS = ("official", "verified", "community")
 ALLOWED_KEYS = {"$schema", "package", "trust", "maintainers"}
 GITHUB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
-MODULE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+MODULE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_ROOT = ROOT / "modules"
