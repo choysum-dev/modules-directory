@@ -1,0 +1,10 @@
+{
+  "$schema": "../../schemas/catalog-entry.schema.json",
+  "package": "@choysum-dev/partner-bank",
+  "trust": "official",
+  "maintainers": [
+    {
+      "github": "choysum-dev"
+    }
+  ]
+}
