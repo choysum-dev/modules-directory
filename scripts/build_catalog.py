@@ -98,6 +98,15 @@ def resolve_integrity(dist_meta: dict[str, Any], package_name: str, version: str
     )
 
 
+def resolve_tarball(dist_meta: dict[str, Any], package_name: str, version: str) -> str:
+    tarball = dist_meta.get("tarball")
+    if isinstance(tarball, str) and tarball.strip():
+        return tarball.strip()
+    raise ValueError(
+        f"Missing dist.tarball for package '{package_name}' version '{version}'"
+    )
+
+
 def fetch_npm_meta(package_name: str) -> dict:
     quoted_name = urllib.parse.quote(package_name, safe="@")
     url = f"https://registry.npmjs.org/{quoted_name}"
@@ -165,8 +174,7 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
         if not isinstance(dist_meta, dict):
             dist_meta = {}
         
-        # Tarball redirect format matching the Phase 4.3 specification
-        tarball_url = f"https://registry.choysum.dev/v1/tarballs/{package_name}/{ver}.tgz"
+        tarball_url = resolve_tarball(dist_meta, package_name, ver)
         
         depends = choysum_meta.get("depends")
         if not isinstance(depends, list):
