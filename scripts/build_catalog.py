@@ -11,12 +11,14 @@ import http.client
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,6 +61,22 @@ NPM_FETCH_TIMEOUT_SECONDS = read_int_env("CHOYSUM_NPM_FETCH_TIMEOUT_SECONDS", 10
 NPM_FETCH_MAX_RETRIES = read_int_env("CHOYSUM_NPM_FETCH_MAX_RETRIES", 3)
 NPM_FETCH_BACKOFF_SECONDS = read_float_env("CHOYSUM_NPM_FETCH_BACKOFF_SECONDS", 1.0)
 BUILD_CONCURRENCY = read_int_env("CHOYSUM_BUILD_CONCURRENCY", 5)
+RANGE_TOKEN_RE = re.compile(r"^(<=|>=|<|>)(.+)$")
+RANGE_OPERATORS = {"<", "<=", ">", ">="}
+
+
+@dataclass(frozen=True)
+class SemVer:
+    major: int
+    minor: int
+    patch: int
+    prerelease: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Bound:
+    version: SemVer
+    inclusive: bool
 
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,6 +89,265 @@ def write_json(path: Path, payload: dict) -> None:
 def load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def parse_numeric_identifier(value: str, field_name: str, version_text: str) -> int:
+    if not value:
+        raise ValueError(f"Invalid SemVer version '{version_text}'.")
+    if not (value.isascii() and value.isdigit()):
+        raise ValueError(f"Invalid SemVer version '{version_text}'.")
+    if len(value) > 1 and value.startswith("0"):
+        raise ValueError(
+            f"Invalid SemVer version '{version_text}': {field_name} has a leading zero."
+        )
+    return int(value)
+
+
+def validate_prerelease_identifiers(prerelease: str, version_text: str) -> tuple[str, ...]:
+    identifiers = prerelease.split(".")
+    normalized: list[str] = []
+    for identifier in identifiers:
+        if not identifier:
+            raise ValueError(f"Invalid SemVer version '{version_text}'.")
+        if not all((ch.isascii() and ch.isalnum()) or ch == "-" for ch in identifier):
+            raise ValueError(f"Invalid SemVer version '{version_text}'.")
+        if identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0"):
+            raise ValueError(
+                f"Invalid SemVer version '{version_text}': prerelease identifier "
+                f"'{identifier}' has a leading zero."
+            )
+        normalized.append(identifier)
+    return tuple(normalized)
+
+
+def validate_build_identifiers(build_meta: str, version_text: str) -> None:
+    for identifier in build_meta.split("."):
+        if not identifier:
+            raise ValueError(f"Invalid SemVer version '{version_text}'.")
+        if not all((ch.isascii() and ch.isalnum()) or ch == "-" for ch in identifier):
+            raise ValueError(f"Invalid SemVer version '{version_text}'.")
+
+
+def parse_semver(version_text: str) -> SemVer:
+    source = version_text.strip()
+    if not source:
+        raise ValueError(f"Invalid SemVer version '{version_text}'.")
+
+    if source.startswith("v"):
+        source = source[1:]
+    if not source:
+        raise ValueError(f"Invalid SemVer version '{version_text}'.")
+
+    core_and_pre, sep_build, build_meta = source.partition("+")
+    if sep_build:
+        validate_build_identifiers(build_meta, version_text)
+
+    core, sep_pre, prerelease_text = core_and_pre.partition("-")
+    core_parts = core.split(".")
+    if len(core_parts) != 3:
+        raise ValueError(f"Invalid SemVer version '{version_text}'.")
+
+    major = parse_numeric_identifier(core_parts[0], "major", version_text)
+    minor = parse_numeric_identifier(core_parts[1], "minor", version_text)
+    patch = parse_numeric_identifier(core_parts[2], "patch", version_text)
+
+    prerelease: tuple[str, ...] = ()
+    if sep_pre:
+        prerelease = validate_prerelease_identifiers(prerelease_text, version_text)
+
+    return SemVer(
+        major=major,
+        minor=minor,
+        patch=patch,
+        prerelease=prerelease,
+    )
+
+
+def format_semver(version: SemVer) -> str:
+    rendered = f"{version.major}.{version.minor}.{version.patch}"
+    if version.prerelease:
+        rendered += "-" + ".".join(version.prerelease)
+    return rendered
+
+
+def compare_semver(left: SemVer, right: SemVer) -> int:
+    if left.major != right.major:
+        return -1 if left.major < right.major else 1
+    if left.minor != right.minor:
+        return -1 if left.minor < right.minor else 1
+    if left.patch != right.patch:
+        return -1 if left.patch < right.patch else 1
+
+    if not left.prerelease and not right.prerelease:
+        return 0
+    if not left.prerelease:
+        return 1
+    if not right.prerelease:
+        return -1
+
+    length = min(len(left.prerelease), len(right.prerelease))
+    for index in range(length):
+        left_id = left.prerelease[index]
+        right_id = right.prerelease[index]
+        if left_id == right_id:
+            continue
+
+        left_is_num = left_id.isdigit()
+        right_is_num = right_id.isdigit()
+
+        if left_is_num and right_is_num:
+            left_num = int(left_id)
+            right_num = int(right_id)
+            return -1 if left_num < right_num else 1
+        if left_is_num != right_is_num:
+            return -1 if left_is_num else 1
+        return -1 if left_id < right_id else 1
+
+    if len(left.prerelease) == len(right.prerelease):
+        return 0
+    return -1 if len(left.prerelease) < len(right.prerelease) else 1
+
+
+def max_lower_bound(left: Bound, right: Bound) -> Bound:
+    cmp_result = compare_semver(left.version, right.version)
+    if cmp_result > 0:
+        return left
+    if cmp_result < 0:
+        return right
+    return Bound(version=left.version, inclusive=left.inclusive and right.inclusive)
+
+
+def min_upper_bound(left: Bound, right: Bound) -> Bound:
+    cmp_result = compare_semver(left.version, right.version)
+    if cmp_result < 0:
+        return left
+    if cmp_result > 0:
+        return right
+    return Bound(version=left.version, inclusive=left.inclusive and right.inclusive)
+
+
+def ensure_non_empty_interval(lower: Bound, upper: Bound, range_text: str) -> None:
+    cmp_result = compare_semver(lower.version, upper.version)
+    if cmp_result > 0:
+        raise ValueError(f"choysum.cli range '{range_text}' has no satisfiable versions.")
+    if cmp_result == 0 and not (lower.inclusive and upper.inclusive):
+        raise ValueError(f"choysum.cli range '{range_text}' has no satisfiable versions.")
+
+
+def normalize_range_tokens(range_text: str) -> list[str]:
+    parts = range_text.strip().split()
+    if not parts:
+        return []
+
+    tokens: list[str] = []
+    cursor = 0
+    while cursor < len(parts):
+        current = parts[cursor]
+        if current in RANGE_OPERATORS:
+            if cursor + 1 >= len(parts):
+                raise ValueError(
+                    f"Invalid choysum.cli range '{range_text}': missing version after '{current}'."
+                )
+            tokens.append(current + parts[cursor + 1])
+            cursor += 2
+            continue
+        tokens.append(current)
+        cursor += 1
+
+    return tokens
+
+
+def parse_cli_range_with_major(range_text: str) -> tuple[str, int]:
+    raw = range_text.strip()
+    if not raw:
+        raise ValueError("choysum.cli range must be a non-empty string.")
+    if "||" in raw:
+        raise ValueError(
+            f"Invalid choysum.cli range '{range_text}': union ranges are not supported."
+        )
+
+    tokenized = normalize_range_tokens(raw)
+    comparators: list[tuple[str, SemVer]] = []
+    for token in tokenized:
+        match = RANGE_TOKEN_RE.fullmatch(token)
+        if not match:
+            raise ValueError(
+                f"Invalid choysum.cli range '{range_text}': expected comparators like '>=1.8.0 <2.0.0'."
+            )
+        operator = match.group(1)
+        version = parse_semver(match.group(2))
+        comparators.append((operator, version))
+
+    lower_bounds = [
+        Bound(version=version, inclusive=(operator == ">="))
+        for operator, version in comparators
+        if operator in (">", ">=")
+    ]
+    upper_bounds = [
+        Bound(version=version, inclusive=(operator == "<="))
+        for operator, version in comparators
+        if operator in ("<", "<=")
+    ]
+
+    if not lower_bounds or not upper_bounds:
+        raise ValueError(
+            f"Invalid choysum.cli range '{range_text}': both lower and upper bounds are required."
+        )
+
+    lower = lower_bounds[0]
+    for candidate in lower_bounds[1:]:
+        lower = max_lower_bound(lower, candidate)
+
+    upper = upper_bounds[0]
+    for candidate in upper_bounds[1:]:
+        upper = min_upper_bound(upper, candidate)
+
+    ensure_non_empty_interval(lower, upper, range_text)
+
+    lower_major = lower.version.major
+    upper_major = upper.version.major
+    if upper_major == lower_major:
+        major = lower_major
+    else:
+        is_next_major_ceiling = (
+            upper_major == lower_major + 1
+            and not upper.inclusive
+            and upper.version.minor == 0
+            and upper.version.patch == 0
+            and not upper.version.prerelease
+        )
+        if not is_next_major_ceiling:
+            raise ValueError(
+                f"Invalid choysum.cli range '{range_text}': range must stay within a single CLI major."
+            )
+        major = lower_major
+
+    normalized = " ".join(
+        f"{operator}{format_semver(version)}" for operator, version in comparators
+    )
+    return normalized, major
+
+
+def resolve_choysum_cli_range(
+    choysum_meta: dict[str, Any],
+    module_id: str,
+    package_name: str,
+    version: str,
+) -> tuple[str, int]:
+    cli_range = choysum_meta.get("cli")
+    if not isinstance(cli_range, str) or not cli_range.strip():
+        raise ValueError(
+            f"Module '{module_id}' version '{version}' is missing required field 'choysum.cli' "
+            f"(package: '{package_name}')."
+        )
+
+    try:
+        return parse_cli_range_with_major(cli_range)
+    except ValueError as exc:
+        raise ValueError(
+            f"Module '{module_id}' version '{version}' has invalid choysum.cli range "
+            f"'{cli_range}' (package: '{package_name}'): {exc}"
+        ) from exc
 
 
 def resolve_integrity(dist_meta: dict[str, Any], package_name: str, version: str) -> str:
@@ -148,7 +425,7 @@ def fetch_npm_meta(package_name: str) -> dict:
         f"after {NPM_FETCH_MAX_RETRIES} attempts: {last_error}"
     ) from last_error
 
-def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
+def process_module(entry_file: Path) -> tuple[str, dict[str, Any], dict[str, int]]:
     entry = load_json(entry_file)
     if not isinstance(entry, dict):
         raise ValueError(f"Catalog entry must be a JSON object: {entry_file}")
@@ -161,6 +438,7 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
     npm_data = fetch_npm_meta(package_name)
     
     versions_out = {}
+    version_major_map_out: dict[str, int] = {}
     versions_raw = npm_data.get("versions")
     if not isinstance(versions_raw, dict):
         versions_raw = {}
@@ -186,16 +464,25 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
 
         integrity = resolve_integrity(dist_meta, package_name, ver)
 
+        normalized_cli_range, cli_major = resolve_choysum_cli_range(
+            choysum_meta=choysum_meta,
+            module_id=module_id,
+            package_name=package_name,
+            version=ver,
+        )
+
         v_entry = {
             "tarball": tarball_url,
             "integrity": integrity,
             "depends": depends,
-            "peerDependencies": peer_deps
+            "peerDependencies": peer_deps,
+            "choysum": {
+                "cli": normalized_cli_range,
+            },
         }
-        if "compatibility" in choysum_meta:
-            v_entry["compatibility"] = choysum_meta["compatibility"]
             
         versions_out[ver] = v_entry
+        version_major_map_out[ver] = cli_major
 
     if not versions_out:
         raise ValueError(
@@ -208,12 +495,13 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any]]:
         "trust": entry.get("trust"),
         "maintainers": entry.get("maintainers", []),
         "versions": versions_out
-    }
+    }, version_major_map_out
 
-def collect_modules() -> dict[str, dict[str, Any]]:
+def collect_modules() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, int]]]:
     modules: dict[str, dict[str, Any]] = {}
+    module_version_major_map: dict[str, dict[str, int]] = {}
     module_sources: dict[str, Path] = {}
-    tasks: dict[concurrent.futures.Future[tuple[str, dict[str, Any]]], Path] = {}
+    tasks: dict[concurrent.futures.Future[tuple[str, dict[str, Any], dict[str, int]]], Path] = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=BUILD_CONCURRENCY) as executor:
         for trust in TRUST_TIERS:
@@ -229,7 +517,7 @@ def collect_modules() -> dict[str, dict[str, Any]]:
         for future in concurrent.futures.as_completed(tasks):
             entry_file = tasks[future]
             try:
-                module_id, mod_payload = future.result()
+                module_id, mod_payload, version_major_map = future.result()
                 if module_id in modules:
                     existing_file = module_sources[module_id]
                     errors.append(
@@ -238,6 +526,7 @@ def collect_modules() -> dict[str, dict[str, Any]]:
                     )
                     continue
                 modules[module_id] = mod_payload
+                module_version_major_map[module_id] = version_major_map
                 module_sources[module_id] = entry_file
             except Exception as e:
                 errors.append(f"  - {entry_file.relative_to(ROOT)}: {e}")
@@ -245,7 +534,7 @@ def collect_modules() -> dict[str, dict[str, Any]]:
     if errors:
         raise RuntimeError("Failed to collect all modules due to the following errors:\n" + "\n".join(errors))
 
-    return modules
+    return modules, module_version_major_map
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -261,8 +550,29 @@ def generate_checksums(files: list[Path]) -> str:
         lines.append(f"{hasher.hexdigest()}  {rel_path}")
     return "\n".join(lines) + "\n"
 
+
+def build_index_payload(generated_at: str, modules: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "generatedAt": generated_at,
+        "modules": modules,
+        "version": 1,
+    }
+
+
+def write_index_artifacts(index_dir: Path, payload: dict[str, Any]) -> tuple[Path, Path, str]:
+    canonical_index = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+    )
+    index_hash = hashlib.sha256(canonical_index.encode("utf-8")).hexdigest()
+
+    index_path = index_dir / "index.json"
+    index_hashed_path = index_dir / f"index.{index_hash}.json"
+    write_text(index_path, canonical_index)
+    write_text(index_hashed_path, canonical_index)
+    return index_path, index_hashed_path, index_hash
+
 def build() -> None:
-    modules = collect_modules()
+    modules, module_version_major_map = collect_modules()
     generated_at = utc_now_iso()
 
     if DIST_ROOT.is_symlink():
@@ -275,29 +585,85 @@ def build() -> None:
     V1_ROOT.mkdir(parents=True, exist_ok=True)
     SCHEMA_OUT.mkdir(parents=True, exist_ok=True)
 
-    index_payload = {
-        "generatedAt": generated_at,
-        "modules": modules,
-        "version": 1,
-    }
-    canonical_index = json.dumps(index_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
-    index_hash = hashlib.sha256(canonical_index.encode("utf-8")).hexdigest()
+    checksum_files: list[Path] = []
+    full_index_payload = build_index_payload(generated_at, modules)
+    index_path, index_hashed_path, index_hash = write_index_artifacts(V1_ROOT, full_index_payload)
+    checksum_files.extend([index_path, index_hashed_path])
 
-    index_path = V1_ROOT / "index.json"
-    index_hashed_path = V1_ROOT / f"index.{index_hash}.json"
-    write_text(index_path, canonical_index)
-    write_text(index_hashed_path, canonical_index)
+    all_versions = {
+        (module_id, version)
+        for module_id, module_payload in modules.items()
+        for version in module_payload.get("versions", {})
+    }
+    shard_versions: set[tuple[str, str]] = set()
+
+    cli_major_indexes: dict[str, dict[str, str]] = {}
+    all_majors = sorted(
+        {
+            major
+            for version_major_map in module_version_major_map.values()
+            for major in version_major_map.values()
+        }
+    )
+
+    for major in all_majors:
+        major_modules: dict[str, dict[str, Any]] = {}
+        for module_id, module_payload in modules.items():
+            module_versions = module_payload.get("versions")
+            if not isinstance(module_versions, dict):
+                continue
+
+            major_versions: dict[str, Any] = {}
+            for version, version_entry in module_versions.items():
+                if module_version_major_map[module_id].get(version) == major:
+                    key = (module_id, version)
+                    if key in shard_versions:
+                        raise RuntimeError(
+                            f"Version '{version}' of module '{module_id}' was assigned to multiple CLI major shards."
+                        )
+                    shard_versions.add(key)
+                    major_versions[version] = version_entry
+
+            if major_versions:
+                major_module_payload = dict(module_payload)
+                major_module_payload["versions"] = major_versions
+                major_modules[module_id] = major_module_payload
+
+        major_index_payload = build_index_payload(generated_at, major_modules)
+        major_dir = V1_ROOT / "cli" / str(major)
+        major_index_path, major_index_hashed_path, major_hash = write_index_artifacts(
+            major_dir,
+            major_index_payload,
+        )
+        checksum_files.extend([major_index_path, major_index_hashed_path])
+        cli_major_indexes[str(major)] = {
+            "indexHash": major_hash,
+            "indexPath": f"/v1/cli/{major}/index.{major_hash}.json",
+        }
+
+    if shard_versions != all_versions:
+        missing = sorted(all_versions - shard_versions)
+        extras = sorted(shard_versions - all_versions)
+        details: list[str] = []
+        if missing:
+            details.append(f"missing in shards: {missing}")
+        if extras:
+            details.append(f"unexpected in shards: {extras}")
+        raise RuntimeError(
+            "CLI major shard consistency check failed: " + "; ".join(details)
+        )
 
     meta_payload = {
         "generatedAt": generated_at,
         "indexHash": index_hash,
         "indexPath": f"/v1/index.{index_hash}.json",
+        "cliMajorIndexes": cli_major_indexes,
     }
     meta_path = V1_ROOT / "meta.json"
     write_json(meta_path, meta_payload)
+    checksum_files.append(meta_path)
 
     # Copy schemas
-    checksum_files = [index_path, index_hashed_path, meta_path]
     for schema_file in sorted(SCHEMA_SRC.glob("*.json")):
         target = SCHEMA_OUT / schema_file.name
         target.write_text(schema_file.read_text(encoding="utf-8"), encoding="utf-8")
@@ -318,7 +684,11 @@ def build() -> None:
     checksums_content = generate_checksums(checksum_files)
     write_text(checksums_path, checksums_content)
 
-    print(f"Successfully built catalog artifacts under dist/ (total modules: {len(modules)})")
+    shard_count = len(cli_major_indexes)
+    print(
+        "Successfully built catalog artifacts under dist/ "
+        f"(total modules: {len(modules)}, cli major shards: {shard_count})"
+    )
 
 if __name__ == "__main__":
     build()
