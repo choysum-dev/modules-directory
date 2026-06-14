@@ -94,7 +94,7 @@ def load_json(path: Path) -> Any:
 def parse_numeric_identifier(value: str, field_name: str, version_text: str) -> int:
     if not value:
         raise ValueError(f"Invalid SemVer version '{version_text}'.")
-    if not value.isdigit():
+    if not (value.isascii() and value.isdigit()):
         raise ValueError(f"Invalid SemVer version '{version_text}'.")
     if len(value) > 1 and value.startswith("0"):
         raise ValueError(
@@ -109,7 +109,7 @@ def validate_prerelease_identifiers(prerelease: str, version_text: str) -> tuple
     for identifier in identifiers:
         if not identifier:
             raise ValueError(f"Invalid SemVer version '{version_text}'.")
-        if not all(ch.isalnum() or ch == "-" for ch in identifier):
+        if not all((ch.isascii() and ch.isalnum()) or ch == "-" for ch in identifier):
             raise ValueError(f"Invalid SemVer version '{version_text}'.")
         if identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0"):
             raise ValueError(
@@ -124,7 +124,7 @@ def validate_build_identifiers(build_meta: str, version_text: str) -> None:
     for identifier in build_meta.split("."):
         if not identifier:
             raise ValueError(f"Invalid SemVer version '{version_text}'.")
-        if not all(ch.isalnum() or ch == "-" for ch in identifier):
+        if not all((ch.isascii() and ch.isalnum()) or ch == "-" for ch in identifier):
             raise ValueError(f"Invalid SemVer version '{version_text}'.")
 
 
