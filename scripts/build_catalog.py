@@ -61,11 +61,6 @@ NPM_FETCH_TIMEOUT_SECONDS = read_int_env("CHOYSUM_NPM_FETCH_TIMEOUT_SECONDS", 10
 NPM_FETCH_MAX_RETRIES = read_int_env("CHOYSUM_NPM_FETCH_MAX_RETRIES", 3)
 NPM_FETCH_BACKOFF_SECONDS = read_float_env("CHOYSUM_NPM_FETCH_BACKOFF_SECONDS", 1.0)
 BUILD_CONCURRENCY = read_int_env("CHOYSUM_BUILD_CONCURRENCY", 5)
-SEMVER_RE = re.compile(
-    r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    r"(?:-((?:0|[1-9]\d*|[0-9A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-][0-9A-Za-z-]*))*))?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
-)
 RANGE_TOKEN_RE = re.compile(r"^(<=|>=|<|>)(.+)$")
 RANGE_OPERATORS = {"<", "<=", ">", ">="}
 
@@ -96,16 +91,74 @@ def load_json(path: Path) -> Any:
         return json.load(handle)
 
 
+def parse_numeric_identifier(value: str, field_name: str, version_text: str) -> int:
+    if not value:
+        raise ValueError(f"Invalid SemVer version '{version_text}'.")
+    if not value.isdigit():
+        raise ValueError(f"Invalid SemVer version '{version_text}'.")
+    if len(value) > 1 and value.startswith("0"):
+        raise ValueError(
+            f"Invalid SemVer version '{version_text}': {field_name} has a leading zero."
+        )
+    return int(value)
+
+
+def validate_prerelease_identifiers(prerelease: str, version_text: str) -> tuple[str, ...]:
+    identifiers = prerelease.split(".")
+    normalized: list[str] = []
+    for identifier in identifiers:
+        if not identifier:
+            raise ValueError(f"Invalid SemVer version '{version_text}'.")
+        if not all(ch.isalnum() or ch == "-" for ch in identifier):
+            raise ValueError(f"Invalid SemVer version '{version_text}'.")
+        if identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0"):
+            raise ValueError(
+                f"Invalid SemVer version '{version_text}': prerelease identifier "
+                f"'{identifier}' has a leading zero."
+            )
+        normalized.append(identifier)
+    return tuple(normalized)
+
+
+def validate_build_identifiers(build_meta: str, version_text: str) -> None:
+    for identifier in build_meta.split("."):
+        if not identifier:
+            raise ValueError(f"Invalid SemVer version '{version_text}'.")
+        if not all(ch.isalnum() or ch == "-" for ch in identifier):
+            raise ValueError(f"Invalid SemVer version '{version_text}'.")
+
+
 def parse_semver(version_text: str) -> SemVer:
-    match = SEMVER_RE.fullmatch(version_text.strip())
-    if not match:
+    source = version_text.strip()
+    if not source:
         raise ValueError(f"Invalid SemVer version '{version_text}'.")
 
-    prerelease = tuple(match.group(4).split(".")) if match.group(4) else ()
+    if source.startswith("v"):
+        source = source[1:]
+    if not source:
+        raise ValueError(f"Invalid SemVer version '{version_text}'.")
+
+    core_and_pre, sep_build, build_meta = source.partition("+")
+    if sep_build:
+        validate_build_identifiers(build_meta, version_text)
+
+    core, sep_pre, prerelease_text = core_and_pre.partition("-")
+    core_parts = core.split(".")
+    if len(core_parts) != 3:
+        raise ValueError(f"Invalid SemVer version '{version_text}'.")
+
+    major = parse_numeric_identifier(core_parts[0], "major", version_text)
+    minor = parse_numeric_identifier(core_parts[1], "minor", version_text)
+    patch = parse_numeric_identifier(core_parts[2], "patch", version_text)
+
+    prerelease: tuple[str, ...] = ()
+    if sep_pre:
+        prerelease = validate_prerelease_identifiers(prerelease_text, version_text)
+
     return SemVer(
-        major=int(match.group(1)),
-        minor=int(match.group(2)),
-        patch=int(match.group(3)),
+        major=major,
+        minor=minor,
+        patch=patch,
         prerelease=prerelease,
     )
 
