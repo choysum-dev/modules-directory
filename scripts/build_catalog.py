@@ -80,6 +80,7 @@ INTEGRITY_ALGORITHM_PRIORITY = {
     "sha512": 4,
 }
 ALLOWED_TARBALL_SCHEMES = {"https", "http"}
+TARBALL_CACHE_DIR_ENV = "CHOYSUM_CACHE_DIR"
 
 ERROR_MODULE_NAME_MISSING = "CATALOG_E_MODULE_NAME_MISSING"
 ERROR_MODULE_NAME_MISMATCH = "CATALOG_E_MODULE_NAME_MISMATCH"
@@ -499,6 +500,55 @@ def parse_integrity_value(integrity: str, package_name: str, version: str) -> tu
     return candidates[0]
 
 
+def resolve_tarball_cache_file(algorithm: str, expected_digest: bytes) -> Path | None:
+    cache_dir_raw = os.getenv(TARBALL_CACHE_DIR_ENV)
+    if not cache_dir_raw:
+        return None
+
+    cache_dir = Path(cache_dir_raw).expanduser()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    return cache_dir / f"{algorithm}-{expected_digest.hex()}.tar"
+
+
+def verify_cached_tarball(
+    cache_file: Path,
+    algorithm: str,
+    expected_digest: bytes,
+) -> bool:
+    if not cache_file.is_file():
+        return False
+
+    hasher = hashlib.new(algorithm)
+    total_bytes = 0
+
+    try:
+        with cache_file.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                total_bytes += len(chunk)
+                if total_bytes > TARBALL_MAX_BYTES:
+                    try:
+                        cache_file.unlink()
+                    except OSError:
+                        pass
+                    return False
+                hasher.update(chunk)
+    except OSError:
+        return False
+
+    if hasher.digest() == expected_digest:
+        return True
+
+    try:
+        cache_file.unlink()
+    except OSError:
+        pass
+    return False
+
+
 def verify_tarball_integrity(
     tarball_url: str,
     integrity: str,
@@ -514,12 +564,28 @@ def verify_tarball_integrity(
         )
 
     algorithm, expected_digest = parse_integrity_value(integrity, package_name, version)
+    cache_file = resolve_tarball_cache_file(algorithm, expected_digest)
+    if cache_file is not None and verify_cached_tarball(cache_file, algorithm, expected_digest):
+        return
+
     hasher = hashlib.new(algorithm)
     req = urllib.request.Request(
         tarball_url,
         headers={"User-Agent": "Choysum-Catalog-Builder/1.0"},
     )
     total_bytes = 0
+    temp_cache_file: Path | None = None
+    cache_handle = None
+    completed = False
+
+    if cache_file is not None:
+        temp_cache_file = cache_file.with_name(
+            f"{cache_file.name}.tmp-{os.getpid()}-{time.time_ns()}"
+        )
+        try:
+            cache_handle = temp_cache_file.open("wb")
+        except OSError:
+            temp_cache_file = None
 
     try:
         with urllib.request.urlopen(req, timeout=TARBALL_VERIFY_TIMEOUT_SECONDS) as response:
@@ -545,6 +611,19 @@ def verify_tarball_integrity(
                         f"max size {TARBALL_MAX_BYTES} bytes.",
                     )
                 hasher.update(chunk)
+                if cache_handle is not None:
+                    cache_handle.write(chunk)
+
+        actual_digest = hasher.digest()
+        if actual_digest != expected_digest:
+            expected_b64 = base64.b64encode(expected_digest).decode("ascii")
+            actual_b64 = base64.b64encode(actual_digest).decode("ascii")
+            raise value_error(
+                ERROR_INTEGRITY_MISMATCH,
+                f"Package '{package_name}' version '{version}' tarball integrity mismatch "
+                f"for {algorithm}: expected '{expected_b64}', got '{actual_b64}'.",
+            )
+        completed = True
     except urllib.error.HTTPError as exc:
         raise RuntimeError(
             build_error(
@@ -567,16 +646,26 @@ def verify_tarball_integrity(
                 f"from '{tarball_url}': {exc}",
             )
         ) from exc
-
-    actual_digest = hasher.digest()
-    if actual_digest != expected_digest:
-        expected_b64 = base64.b64encode(expected_digest).decode("ascii")
-        actual_b64 = base64.b64encode(actual_digest).decode("ascii")
-        raise value_error(
-            ERROR_INTEGRITY_MISMATCH,
-            f"Package '{package_name}' version '{version}' tarball integrity mismatch "
-            f"for {algorithm}: expected '{expected_b64}', got '{actual_b64}'.",
-        )
+    finally:
+        if cache_handle is not None:
+            try:
+                cache_handle.close()
+            except OSError:
+                pass
+        if temp_cache_file is not None and temp_cache_file.exists():
+            if completed and cache_file is not None:
+                try:
+                    temp_cache_file.replace(cache_file)
+                except OSError:
+                    try:
+                        temp_cache_file.unlink()
+                    except OSError:
+                        pass
+            else:
+                try:
+                    temp_cache_file.unlink()
+                except OSError:
+                    pass
 
 
 def validate_official_pre1_cli_range(
