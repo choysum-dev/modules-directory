@@ -73,6 +73,13 @@ INTEGRITY_ALGORITHMS = {
     "sha384": 48,
     "sha512": 64,
 }
+INTEGRITY_ALGORITHM_PRIORITY = {
+    "sha1": 1,
+    "sha256": 2,
+    "sha384": 3,
+    "sha512": 4,
+}
+ALLOWED_TARBALL_SCHEMES = {"https", "http"}
 
 ERROR_MODULE_NAME_MISSING = "CATALOG_E_MODULE_NAME_MISSING"
 ERROR_MODULE_NAME_MISMATCH = "CATALOG_E_MODULE_NAME_MISMATCH"
@@ -81,8 +88,11 @@ ERROR_INTEGRITY_UNSUPPORTED_ALGORITHM = "CATALOG_E_INTEGRITY_UNSUPPORTED_ALGORIT
 ERROR_INTEGRITY_MISMATCH = "CATALOG_E_INTEGRITY_MISMATCH"
 ERROR_TARBALL_DOWNLOAD = "CATALOG_E_TARBALL_DOWNLOAD"
 ERROR_TARBALL_TOO_LARGE = "CATALOG_E_TARBALL_TOO_LARGE"
+ERROR_TARBALL_URL_SCHEME = "CATALOG_E_TARBALL_URL_SCHEME"
 ERROR_DEPENDS_INVALID_ID = "CATALOG_E_DEPENDS_INVALID_ID"
 ERROR_DEPENDS_BROKEN_LINK = "CATALOG_E_DEPENDS_BROKEN_LINK"
+ERROR_DEPENDS_DUPLICATE = "CATALOG_E_DEPENDS_DUPLICATE"
+ERROR_DEPENDS_SELF_REFERENCE = "CATALOG_E_DEPENDS_SELF_REFERENCE"
 ERROR_OFFICIAL_PRE1_CLI_RANGE = "CATALOG_E_OFFICIAL_PRE1_CLI_RANGE"
 ERROR_MODULE_VERSION_INVALID = "CATALOG_E_MODULE_VERSION_INVALID"
 
@@ -445,39 +455,48 @@ def parse_integrity_value(integrity: str, package_name: str, version: str) -> tu
             f"Package '{package_name}' version '{version}' has an empty integrity value.",
         )
 
-    algorithm, sep, digest_b64 = tokens[0].partition("-")
-    if not sep or not algorithm or not digest_b64:
+    candidates: list[tuple[str, bytes]] = []
+    has_supported_algorithm = False
+
+    for token in tokens:
+        algorithm, sep, digest_b64 = token.partition("-")
+        if not sep or not algorithm or not digest_b64:
+            continue
+
+        normalized_algorithm = algorithm.lower()
+        expected_length = INTEGRITY_ALGORITHMS.get(normalized_algorithm)
+        if expected_length is None:
+            continue
+        has_supported_algorithm = True
+
+        try:
+            digest = base64.b64decode(digest_b64, validate=True)
+        except (ValueError, binascii.Error):
+            continue
+
+        if len(digest) != expected_length:
+            continue
+        candidates.append((normalized_algorithm, digest))
+
+    if not candidates:
+        if not has_supported_algorithm:
+            raise value_error(
+                ERROR_INTEGRITY_UNSUPPORTED_ALGORITHM,
+                f"Package '{package_name}' version '{version}' has no supported integrity "
+                f"algorithms in '{integrity}'.",
+            )
+
         raise value_error(
             ERROR_INTEGRITY_FORMAT,
-            f"Package '{package_name}' version '{version}' has invalid integrity "
-            f"'{integrity}'. Expected '<algorithm>-<base64>'.",
+            f"Package '{package_name}' version '{version}' has no valid integrity digest "
+            f"in '{integrity}'.",
         )
 
-    normalized_algorithm = algorithm.lower()
-    expected_length = INTEGRITY_ALGORITHMS.get(normalized_algorithm)
-    if expected_length is None:
-        raise value_error(
-            ERROR_INTEGRITY_UNSUPPORTED_ALGORITHM,
-            f"Package '{package_name}' version '{version}' uses unsupported integrity "
-            f"algorithm '{algorithm}'.",
-        )
-
-    try:
-        digest = base64.b64decode(digest_b64, validate=True)
-    except (ValueError, binascii.Error) as exc:
-        raise value_error(
-            ERROR_INTEGRITY_FORMAT,
-            f"Package '{package_name}' version '{version}' has non-base64 integrity digest.",
-        ) from exc
-
-    if len(digest) != expected_length:
-        raise value_error(
-            ERROR_INTEGRITY_FORMAT,
-            f"Package '{package_name}' version '{version}' has integrity digest length "
-            f"{len(digest)}, expected {expected_length} for {normalized_algorithm}.",
-        )
-
-    return normalized_algorithm, digest
+    candidates.sort(
+        key=lambda item: INTEGRITY_ALGORITHM_PRIORITY[item[0]],
+        reverse=True,
+    )
+    return candidates[0]
 
 
 def verify_tarball_integrity(
@@ -486,6 +505,14 @@ def verify_tarball_integrity(
     package_name: str,
     version: str,
 ) -> None:
+    parsed_url = urllib.parse.urlparse(tarball_url)
+    if parsed_url.scheme.lower() not in ALLOWED_TARBALL_SCHEMES or not parsed_url.netloc:
+        raise value_error(
+            ERROR_TARBALL_URL_SCHEME,
+            f"Package '{package_name}' version '{version}' has disallowed tarball URL "
+            f"scheme in '{tarball_url}'. Allowed schemes: {sorted(ALLOWED_TARBALL_SCHEMES)}.",
+        )
+
     algorithm, expected_digest = parse_integrity_value(integrity, package_name, version)
     hasher = hashlib.new(algorithm)
     req = urllib.request.Request(
@@ -496,6 +523,19 @@ def verify_tarball_integrity(
 
     try:
         with urllib.request.urlopen(req, timeout=TARBALL_VERIFY_TIMEOUT_SECONDS) as response:
+            content_length_header = response.headers.get("Content-Length")
+            if content_length_header:
+                try:
+                    content_length = int(content_length_header)
+                except ValueError:
+                    content_length = -1
+                if content_length > TARBALL_MAX_BYTES:
+                    raise value_error(
+                        ERROR_TARBALL_TOO_LARGE,
+                        f"Package '{package_name}' version '{version}' tarball content-length "
+                        f"{content_length} exceeds max size {TARBALL_MAX_BYTES} bytes.",
+                    )
+
             for chunk in iter(lambda: response.read(65536), b""):
                 total_bytes += len(chunk)
                 if total_bytes > TARBALL_MAX_BYTES:
@@ -586,6 +626,7 @@ def validate_runtime_contracts(modules: dict[str, dict[str, Any]]) -> None:
 
             depends = version_payload.get("depends")
             if isinstance(depends, list):
+                seen_deps: set[str] = set()
                 for dep in depends:
                     if not isinstance(dep, str) or not dep.strip():
                         errors.append(
@@ -596,12 +637,32 @@ def validate_runtime_contracts(modules: dict[str, dict[str, Any]]) -> None:
                             )
                         )
                         continue
-                    if dep not in known_modules:
+                    normalized_dep = dep.strip()
+                    if normalized_dep == module_id:
+                        errors.append(
+                            build_error(
+                                ERROR_DEPENDS_SELF_REFERENCE,
+                                f"Module '{module_id}' version '{version}' depends on itself "
+                                f"(package: '{package_name}').",
+                            )
+                        )
+                        continue
+                    if normalized_dep in seen_deps:
+                        errors.append(
+                            build_error(
+                                ERROR_DEPENDS_DUPLICATE,
+                                f"Module '{module_id}' version '{version}' has duplicate depends "
+                                f"entry '{normalized_dep}' (package: '{package_name}').",
+                            )
+                        )
+                        continue
+                    seen_deps.add(normalized_dep)
+                    if normalized_dep not in known_modules:
                         errors.append(
                             build_error(
                                 ERROR_DEPENDS_BROKEN_LINK,
                                 f"Module '{module_id}' version '{version}' depends on "
-                                f"unknown module '{dep}' (package: '{package_name}').",
+                                f"unknown module '{normalized_dep}' (package: '{package_name}').",
                             )
                         )
 
