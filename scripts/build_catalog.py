@@ -533,6 +533,7 @@ def verify_cached_tarball(
                     try:
                         cache_file.unlink()
                     except OSError:
+                        # Cache cleanup is best-effort; deletion failure is non-fatal.
                         pass
                     return False
                 hasher.update(chunk)
@@ -545,6 +546,7 @@ def verify_cached_tarball(
     try:
         cache_file.unlink()
     except OSError:
+        # Cache cleanup is best-effort; deletion failure is non-fatal.
         pass
     return False
 
