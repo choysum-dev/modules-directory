@@ -653,6 +653,7 @@ def verify_tarball_integrity(
             try:
                 cache_handle.close()
             except OSError:
+                # Cache write handle cleanup is best-effort; close failure is non-fatal.
                 pass
         if temp_cache_file is not None and temp_cache_file.exists():
             if completed and cache_file is not None:
