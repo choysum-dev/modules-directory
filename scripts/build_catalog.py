@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import concurrent.futures
 import http.client
 import hashlib
@@ -61,8 +62,40 @@ NPM_FETCH_TIMEOUT_SECONDS = read_int_env("CHOYSUM_NPM_FETCH_TIMEOUT_SECONDS", 10
 NPM_FETCH_MAX_RETRIES = read_int_env("CHOYSUM_NPM_FETCH_MAX_RETRIES", 3)
 NPM_FETCH_BACKOFF_SECONDS = read_float_env("CHOYSUM_NPM_FETCH_BACKOFF_SECONDS", 1.0)
 BUILD_CONCURRENCY = read_int_env("CHOYSUM_BUILD_CONCURRENCY", 5)
+TARBALL_VERIFY_TIMEOUT_SECONDS = read_int_env("CHOYSUM_TARBALL_VERIFY_TIMEOUT_SECONDS", 30)
+TARBALL_MAX_BYTES = read_int_env("CHOYSUM_TARBALL_MAX_BYTES", 50 * 1024 * 1024)
+OFFICIAL_PRE1_CLI_RANGE = ">=0.0.0-0 <0.0.0"
 RANGE_TOKEN_RE = re.compile(r"^(<=|>=|<|>)(.+)$")
 RANGE_OPERATORS = {"<", "<=", ">", ">="}
+INTEGRITY_ALGORITHMS = {
+    "sha1": 20,
+    "sha256": 32,
+    "sha384": 48,
+    "sha512": 64,
+}
+INTEGRITY_ALGORITHM_PRIORITY = {
+    "sha1": 1,
+    "sha256": 2,
+    "sha384": 3,
+    "sha512": 4,
+}
+ALLOWED_TARBALL_SCHEMES = {"https", "http"}
+TARBALL_CACHE_DIR_ENV = "CHOYSUM_CACHE_DIR"
+
+ERROR_MODULE_NAME_MISSING = "CATALOG_E_MODULE_NAME_MISSING"
+ERROR_MODULE_NAME_MISMATCH = "CATALOG_E_MODULE_NAME_MISMATCH"
+ERROR_INTEGRITY_FORMAT = "CATALOG_E_INTEGRITY_FORMAT"
+ERROR_INTEGRITY_UNSUPPORTED_ALGORITHM = "CATALOG_E_INTEGRITY_UNSUPPORTED_ALGORITHM"
+ERROR_INTEGRITY_MISMATCH = "CATALOG_E_INTEGRITY_MISMATCH"
+ERROR_TARBALL_DOWNLOAD = "CATALOG_E_TARBALL_DOWNLOAD"
+ERROR_TARBALL_TOO_LARGE = "CATALOG_E_TARBALL_TOO_LARGE"
+ERROR_TARBALL_URL_SCHEME = "CATALOG_E_TARBALL_URL_SCHEME"
+ERROR_DEPENDS_INVALID_ID = "CATALOG_E_DEPENDS_INVALID_ID"
+ERROR_DEPENDS_BROKEN_LINK = "CATALOG_E_DEPENDS_BROKEN_LINK"
+ERROR_DEPENDS_DUPLICATE = "CATALOG_E_DEPENDS_DUPLICATE"
+ERROR_DEPENDS_SELF_REFERENCE = "CATALOG_E_DEPENDS_SELF_REFERENCE"
+ERROR_OFFICIAL_PRE1_CLI_RANGE = "CATALOG_E_OFFICIAL_PRE1_CLI_RANGE"
+ERROR_MODULE_VERSION_INVALID = "CATALOG_E_MODULE_VERSION_INVALID"
 
 
 @dataclass(frozen=True)
@@ -77,6 +110,14 @@ class SemVer:
 class Bound:
     version: SemVer
     inclusive: bool
+
+
+def build_error(code: str, message: str) -> str:
+    return f"[{code}] {message}"
+
+
+def value_error(code: str, message: str) -> ValueError:
+    return ValueError(build_error(code, message))
 
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -384,6 +425,346 @@ def resolve_tarball(dist_meta: dict[str, Any], package_name: str, version: str) 
     )
 
 
+def validate_module_name(
+    choysum_meta: dict[str, Any],
+    module_id: str,
+    package_name: str,
+    version: str,
+) -> None:
+    module_name = choysum_meta.get("moduleName")
+    if not isinstance(module_name, str) or not module_name.strip():
+        raise value_error(
+            ERROR_MODULE_NAME_MISSING,
+            f"Module '{module_id}' version '{version}' is missing required field "
+            f"'choysum.moduleName' (package: '{package_name}').",
+        )
+
+    normalized = module_name.strip()
+    if normalized != module_id:
+        raise value_error(
+            ERROR_MODULE_NAME_MISMATCH,
+            f"Module '{module_id}' version '{version}' has choysum.moduleName "
+            f"'{normalized}', expected '{module_id}' (package: '{package_name}').",
+        )
+
+
+def parse_integrity_value(integrity: str, package_name: str, version: str) -> tuple[str, bytes]:
+    tokens = integrity.strip().split()
+    if not tokens:
+        raise value_error(
+            ERROR_INTEGRITY_FORMAT,
+            f"Package '{package_name}' version '{version}' has an empty integrity value.",
+        )
+
+    candidates: list[tuple[str, bytes]] = []
+    has_supported_algorithm = False
+
+    for token in tokens:
+        algorithm, sep, digest_b64 = token.partition("-")
+        if not sep or not algorithm or not digest_b64:
+            continue
+
+        normalized_algorithm = algorithm.lower()
+        expected_length = INTEGRITY_ALGORITHMS.get(normalized_algorithm)
+        if expected_length is None:
+            continue
+        has_supported_algorithm = True
+
+        try:
+            digest = base64.b64decode(digest_b64, validate=True)
+        except (ValueError, binascii.Error):
+            continue
+
+        if len(digest) != expected_length:
+            continue
+        candidates.append((normalized_algorithm, digest))
+
+    if not candidates:
+        if not has_supported_algorithm:
+            raise value_error(
+                ERROR_INTEGRITY_UNSUPPORTED_ALGORITHM,
+                f"Package '{package_name}' version '{version}' has no supported integrity "
+                f"algorithms in '{integrity}'.",
+            )
+
+        raise value_error(
+            ERROR_INTEGRITY_FORMAT,
+            f"Package '{package_name}' version '{version}' has no valid integrity digest "
+            f"in '{integrity}'.",
+        )
+
+    candidates.sort(
+        key=lambda item: INTEGRITY_ALGORITHM_PRIORITY[item[0]],
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def resolve_tarball_cache_file(algorithm: str, expected_digest: bytes) -> Path | None:
+    cache_dir_raw = os.getenv(TARBALL_CACHE_DIR_ENV)
+    if not cache_dir_raw:
+        return None
+
+    cache_dir = Path(cache_dir_raw).expanduser()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    return cache_dir / f"{algorithm}-{expected_digest.hex()}.tar"
+
+
+def verify_cached_tarball(
+    cache_file: Path,
+    algorithm: str,
+    expected_digest: bytes,
+) -> bool:
+    if not cache_file.is_file():
+        return False
+
+    hasher = hashlib.new(algorithm)
+    total_bytes = 0
+
+    try:
+        with cache_file.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                total_bytes += len(chunk)
+                if total_bytes > TARBALL_MAX_BYTES:
+                    try:
+                        cache_file.unlink()
+                    except OSError:
+                        # Cache cleanup is best-effort; deletion failure is non-fatal.
+                        pass
+                    return False
+                hasher.update(chunk)
+    except OSError:
+        return False
+
+    if hasher.digest() == expected_digest:
+        return True
+
+    try:
+        cache_file.unlink()
+    except OSError:
+        # Cache cleanup is best-effort; deletion failure is non-fatal.
+        pass
+    return False
+
+
+def verify_tarball_integrity(
+    tarball_url: str,
+    integrity: str,
+    package_name: str,
+    version: str,
+) -> None:
+    parsed_url = urllib.parse.urlparse(tarball_url)
+    if parsed_url.scheme.lower() not in ALLOWED_TARBALL_SCHEMES or not parsed_url.netloc:
+        raise value_error(
+            ERROR_TARBALL_URL_SCHEME,
+            f"Package '{package_name}' version '{version}' has disallowed tarball URL "
+            f"scheme in '{tarball_url}'. Allowed schemes: {sorted(ALLOWED_TARBALL_SCHEMES)}.",
+        )
+
+    algorithm, expected_digest = parse_integrity_value(integrity, package_name, version)
+    cache_file = resolve_tarball_cache_file(algorithm, expected_digest)
+    if cache_file is not None and verify_cached_tarball(cache_file, algorithm, expected_digest):
+        return
+
+    hasher = hashlib.new(algorithm)
+    req = urllib.request.Request(
+        tarball_url,
+        headers={"User-Agent": "Choysum-Catalog-Builder/1.0"},
+    )
+    total_bytes = 0
+    temp_cache_file: Path | None = None
+    cache_handle = None
+    completed = False
+
+    if cache_file is not None:
+        temp_cache_file = cache_file.with_name(
+            f"{cache_file.name}.tmp-{os.getpid()}-{time.time_ns()}"
+        )
+        try:
+            cache_handle = temp_cache_file.open("wb")
+        except OSError:
+            temp_cache_file = None
+
+    try:
+        with urllib.request.urlopen(req, timeout=TARBALL_VERIFY_TIMEOUT_SECONDS) as response:
+            content_length_header = response.headers.get("Content-Length")
+            if content_length_header:
+                try:
+                    content_length = int(content_length_header)
+                except ValueError:
+                    content_length = -1
+                if content_length > TARBALL_MAX_BYTES:
+                    raise value_error(
+                        ERROR_TARBALL_TOO_LARGE,
+                        f"Package '{package_name}' version '{version}' tarball content-length "
+                        f"{content_length} exceeds max size {TARBALL_MAX_BYTES} bytes.",
+                    )
+
+            for chunk in iter(lambda: response.read(65536), b""):
+                total_bytes += len(chunk)
+                if total_bytes > TARBALL_MAX_BYTES:
+                    raise value_error(
+                        ERROR_TARBALL_TOO_LARGE,
+                        f"Package '{package_name}' version '{version}' tarball exceeds "
+                        f"max size {TARBALL_MAX_BYTES} bytes.",
+                    )
+                hasher.update(chunk)
+                if cache_handle is not None:
+                    cache_handle.write(chunk)
+
+        actual_digest = hasher.digest()
+        if actual_digest != expected_digest:
+            expected_b64 = base64.b64encode(expected_digest).decode("ascii")
+            actual_b64 = base64.b64encode(actual_digest).decode("ascii")
+            raise value_error(
+                ERROR_INTEGRITY_MISMATCH,
+                f"Package '{package_name}' version '{version}' tarball integrity mismatch "
+                f"for {algorithm}: expected '{expected_b64}', got '{actual_b64}'.",
+            )
+        completed = True
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            build_error(
+                ERROR_TARBALL_DOWNLOAD,
+                f"Failed to download tarball for package '{package_name}' version '{version}' "
+                f"from '{tarball_url}' (status: {exc.code}).",
+            )
+        ) from exc
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        socket.timeout,
+        TimeoutError,
+        ConnectionError,
+    ) as exc:
+        raise RuntimeError(
+            build_error(
+                ERROR_TARBALL_DOWNLOAD,
+                f"Failed to download tarball for package '{package_name}' version '{version}' "
+                f"from '{tarball_url}': {exc}",
+            )
+        ) from exc
+    finally:
+        if cache_handle is not None:
+            try:
+                cache_handle.close()
+            except OSError:
+                # Cache write handle cleanup is best-effort; close failure is non-fatal.
+                pass
+        if temp_cache_file is not None and temp_cache_file.exists():
+            if completed and cache_file is not None:
+                try:
+                    temp_cache_file.replace(cache_file)
+                except OSError:
+                    try:
+                        temp_cache_file.unlink()
+                    except OSError:
+                        # Temp cache cleanup is best-effort; deletion failure is non-fatal.
+                        pass
+            else:
+                try:
+                    temp_cache_file.unlink()
+                except OSError:
+                    # Temp cache cleanup is best-effort; deletion failure is non-fatal.
+                    pass
+
+
+def validate_official_pre1_cli_range(
+    module_id: str,
+    package_name: str,
+    version: str,
+    trust: Any,
+    normalized_cli_range: str,
+) -> None:
+    if trust != "official":
+        return
+
+    try:
+        parsed_version = parse_semver(version)
+    except ValueError as exc:
+        raise value_error(
+            ERROR_MODULE_VERSION_INVALID,
+            f"Official module '{module_id}' has invalid version key '{version}' "
+            f"(package: '{package_name}').",
+        ) from exc
+
+    if parsed_version.major == 0 and parsed_version.minor == 0 and parsed_version.patch == 0:
+        if normalized_cli_range != OFFICIAL_PRE1_CLI_RANGE:
+            raise value_error(
+                ERROR_OFFICIAL_PRE1_CLI_RANGE,
+                f"Official module '{module_id}' version '{version}' must use "
+                f"choysum.cli '{OFFICIAL_PRE1_CLI_RANGE}', got '{normalized_cli_range}' "
+                f"(package: '{package_name}').",
+            )
+
+
+def validate_runtime_contracts(modules: dict[str, dict[str, Any]]) -> None:
+    known_modules = set(modules.keys())
+    errors: list[str] = []
+
+    for module_id in sorted(modules.keys()):
+        module_payload = modules[module_id]
+        package_name = module_payload.get("package")
+        versions = module_payload.get("versions")
+        if not isinstance(versions, dict):
+            continue
+
+        for version in sorted(versions.keys()):
+            version_payload = versions[version]
+            if not isinstance(version_payload, dict):
+                continue
+
+            depends = version_payload.get("depends")
+            if isinstance(depends, list):
+                seen_deps: set[str] = set()
+                for dep in depends:
+                    if not isinstance(dep, str) or not dep.strip():
+                        errors.append(
+                            build_error(
+                                ERROR_DEPENDS_INVALID_ID,
+                                f"Module '{module_id}' version '{version}' has invalid "
+                                f"depends entry {dep!r} (package: '{package_name}').",
+                            )
+                        )
+                        continue
+                    normalized_dep = dep.strip()
+                    if normalized_dep == module_id:
+                        errors.append(
+                            build_error(
+                                ERROR_DEPENDS_SELF_REFERENCE,
+                                f"Module '{module_id}' version '{version}' depends on itself "
+                                f"(package: '{package_name}').",
+                            )
+                        )
+                        continue
+                    if normalized_dep in seen_deps:
+                        errors.append(
+                            build_error(
+                                ERROR_DEPENDS_DUPLICATE,
+                                f"Module '{module_id}' version '{version}' has duplicate depends "
+                                f"entry '{normalized_dep}' (package: '{package_name}').",
+                            )
+                        )
+                        continue
+                    seen_deps.add(normalized_dep)
+                    if normalized_dep not in known_modules:
+                        errors.append(
+                            build_error(
+                                ERROR_DEPENDS_BROKEN_LINK,
+                                f"Module '{module_id}' version '{version}' depends on "
+                                f"unknown module '{normalized_dep}' (package: '{package_name}').",
+                            )
+                        )
+
+    if errors:
+        details = "\n".join(f"  - {err}" for err in errors)
+        raise RuntimeError("Runtime contract validation failed:\n" + details)
+
+
 def fetch_npm_meta(package_name: str) -> dict:
     quoted_name = urllib.parse.quote(package_name, safe="@")
     url = f"https://registry.npmjs.org/{quoted_name}"
@@ -433,6 +814,7 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any], dict[str, int
     package_name = entry.get("package")
     if not isinstance(package_name, str) or not package_name.strip():
         raise ValueError(f"Invalid or missing 'package' field in {entry_file}")
+    trust = entry.get("trust")
     
     print(f"Fetching NPM metadata for {package_name} (module: {module_id})...")
     npm_data = fetch_npm_meta(package_name)
@@ -448,6 +830,8 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any], dict[str, int
         choysum_meta = v_data.get("choysum")
         if not isinstance(choysum_meta, dict):
             choysum_meta = {}
+        validate_module_name(choysum_meta, module_id, package_name, ver)
+
         dist_meta = v_data.get("dist")
         if not isinstance(dist_meta, dict):
             dist_meta = {}
@@ -463,12 +847,20 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any], dict[str, int
             peer_deps = {}
 
         integrity = resolve_integrity(dist_meta, package_name, ver)
+        verify_tarball_integrity(tarball_url, integrity, package_name, ver)
 
         normalized_cli_range, cli_major = resolve_choysum_cli_range(
             choysum_meta=choysum_meta,
             module_id=module_id,
             package_name=package_name,
             version=ver,
+        )
+        validate_official_pre1_cli_range(
+            module_id=module_id,
+            package_name=package_name,
+            version=ver,
+            trust=trust,
+            normalized_cli_range=normalized_cli_range,
         )
 
         v_entry = {
@@ -492,7 +884,7 @@ def process_module(entry_file: Path) -> tuple[str, dict[str, Any], dict[str, int
     return module_id, {
         "moduleId": module_id,
         "package": package_name,
-        "trust": entry.get("trust"),
+        "trust": trust,
         "maintainers": entry.get("maintainers", []),
         "versions": versions_out
     }, version_major_map_out
@@ -573,6 +965,7 @@ def write_index_artifacts(index_dir: Path, payload: dict[str, Any]) -> tuple[Pat
 
 def build() -> None:
     modules, module_version_major_map = collect_modules()
+    validate_runtime_contracts(modules)
     generated_at = utc_now_iso()
 
     if DIST_ROOT.is_symlink():
