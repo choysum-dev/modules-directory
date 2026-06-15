@@ -64,7 +64,6 @@ NPM_FETCH_BACKOFF_SECONDS = read_float_env("CHOYSUM_NPM_FETCH_BACKOFF_SECONDS", 
 BUILD_CONCURRENCY = read_int_env("CHOYSUM_BUILD_CONCURRENCY", 5)
 TARBALL_VERIFY_TIMEOUT_SECONDS = read_int_env("CHOYSUM_TARBALL_VERIFY_TIMEOUT_SECONDS", 30)
 TARBALL_MAX_BYTES = read_int_env("CHOYSUM_TARBALL_MAX_BYTES", 50 * 1024 * 1024)
-PEER_DEP_ALLOWLIST_PATH = SCHEMA_SRC / "peer-dependencies-allowlist.json"
 OFFICIAL_PRE1_CLI_RANGE = ">=0.0.0-0 <0.0.0"
 RANGE_TOKEN_RE = re.compile(r"^(<=|>=|<|>)(.+)$")
 RANGE_OPERATORS = {"<", "<=", ">", ">="}
@@ -84,8 +83,6 @@ ERROR_TARBALL_DOWNLOAD = "CATALOG_E_TARBALL_DOWNLOAD"
 ERROR_TARBALL_TOO_LARGE = "CATALOG_E_TARBALL_TOO_LARGE"
 ERROR_DEPENDS_INVALID_ID = "CATALOG_E_DEPENDS_INVALID_ID"
 ERROR_DEPENDS_BROKEN_LINK = "CATALOG_E_DEPENDS_BROKEN_LINK"
-ERROR_PEER_DEP_UNKNOWN = "CATALOG_E_PEER_DEP_UNKNOWN"
-ERROR_PEER_DEP_ALLOWLIST_INVALID = "CATALOG_E_PEER_DEP_ALLOWLIST_INVALID"
 ERROR_OFFICIAL_PRE1_CLI_RANGE = "CATALOG_E_OFFICIAL_PRE1_CLI_RANGE"
 ERROR_MODULE_VERSION_INVALID = "CATALOG_E_MODULE_VERSION_INVALID"
 
@@ -102,15 +99,6 @@ class SemVer:
 class Bound:
     version: SemVer
     inclusive: bool
-
-
-@dataclass(frozen=True)
-class PeerDependencyException:
-    name: str
-    module_id: str
-    package: str
-    version: str
-    reason: str
 
 
 def build_error(code: str, message: str) -> str:
@@ -580,135 +568,13 @@ def validate_official_pre1_cli_range(
             )
 
 
-def load_peer_dependency_allowlist() -> tuple[set[str], dict[tuple[str, str, str, str], str]]:
-    if not PEER_DEP_ALLOWLIST_PATH.is_file():
-        raise RuntimeError(
-            build_error(
-                ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                "Missing peer dependency allowlist file: "
-                f"{PEER_DEP_ALLOWLIST_PATH.relative_to(ROOT)}",
-            )
-        )
-
-    payload = load_json(PEER_DEP_ALLOWLIST_PATH)
-    if not isinstance(payload, dict):
-        raise RuntimeError(
-            build_error(
-                ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                f"Allowlist file {PEER_DEP_ALLOWLIST_PATH.relative_to(ROOT)} "
-                "must be a JSON object.",
-            )
-        )
-
-    allowed_raw = payload.get("allowedPeerDependencies")
-    if not isinstance(allowed_raw, list):
-        raise RuntimeError(
-            build_error(
-                ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                f"Allowlist file {PEER_DEP_ALLOWLIST_PATH.relative_to(ROOT)} "
-                "must contain 'allowedPeerDependencies' as an array.",
-            )
-        )
-
-    allowed: set[str] = set()
-    for item in allowed_raw:
-        if not isinstance(item, str) or not item.strip():
-            raise RuntimeError(
-                build_error(
-                    ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                    f"Allowlist file {PEER_DEP_ALLOWLIST_PATH.relative_to(ROOT)} "
-                    f"contains invalid dependency name: {item!r}.",
-                )
-            )
-        allowed.add(item.strip())
-
-    if not allowed:
-        raise RuntimeError(
-            build_error(
-                ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                f"Allowlist file {PEER_DEP_ALLOWLIST_PATH.relative_to(ROOT)} is empty.",
-            )
-        )
-
-    exceptions_raw = payload.get("scopedPeerDependencyExceptions", [])
-    if not isinstance(exceptions_raw, list):
-        raise RuntimeError(
-            build_error(
-                ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                f"Allowlist file {PEER_DEP_ALLOWLIST_PATH.relative_to(ROOT)} must contain "
-                "'scopedPeerDependencyExceptions' as an array when present.",
-            )
-        )
-
-    exceptions: dict[tuple[str, str, str, str], str] = {}
-    for item in exceptions_raw:
-        if not isinstance(item, dict):
-            raise RuntimeError(
-                build_error(
-                    ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                    f"Allowlist file {PEER_DEP_ALLOWLIST_PATH.relative_to(ROOT)} "
-                    f"contains non-object scoped exception: {item!r}.",
-                )
-            )
-
-        exception = PeerDependencyException(
-            name=str(item.get("name", "")).strip(),
-            module_id=str(item.get("moduleId", "")).strip(),
-            package=str(item.get("package", "")).strip(),
-            version=str(item.get("version", "")).strip(),
-            reason=str(item.get("reason", "")).strip(),
-        )
-        if (
-            not exception.name
-            or not exception.module_id
-            or not exception.package
-            or not exception.version
-            or not exception.reason
-        ):
-            raise RuntimeError(
-                build_error(
-                    ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                    f"Allowlist file {PEER_DEP_ALLOWLIST_PATH.relative_to(ROOT)} has an "
-                    f"invalid scoped exception: {item!r}.",
-                )
-            )
-
-        if exception.name in allowed:
-            raise RuntimeError(
-                build_error(
-                    ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                    f"Scoped exception for '{exception.name}' is redundant because it is "
-                    "already globally allowed.",
-                )
-            )
-
-        key = (exception.name, exception.module_id, exception.package, exception.version)
-        if key in exceptions:
-            raise RuntimeError(
-                build_error(
-                    ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                    f"Duplicate scoped peer dependency exception detected for '{exception.name}' "
-                    f"on module '{exception.module_id}' version '{exception.version}'.",
-                )
-            )
-        exceptions[key] = exception.reason
-
-    return allowed, exceptions
-
-
-def validate_runtime_contracts(
-    modules: dict[str, dict[str, Any]],
-    allowed_peer_deps: set[str],
-    scoped_exceptions: dict[tuple[str, str, str, str], str],
-) -> None:
+def validate_runtime_contracts(modules: dict[str, dict[str, Any]]) -> None:
     known_modules = set(modules.keys())
     errors: list[str] = []
-    used_scoped_exceptions: set[tuple[str, str, str, str]] = set()
 
     for module_id in sorted(modules.keys()):
         module_payload = modules[module_id]
         package_name = module_payload.get("package")
-        package_name_text = package_name if isinstance(package_name, str) else "<unknown-package>"
         versions = module_payload.get("versions")
         if not isinstance(versions, dict):
             continue
@@ -738,44 +604,6 @@ def validate_runtime_contracts(
                                 f"unknown module '{dep}' (package: '{package_name}').",
                             )
                         )
-
-            peer_deps = version_payload.get("peerDependencies")
-            if isinstance(peer_deps, dict):
-                for peer_name in sorted(peer_deps.keys()):
-                    if peer_name in allowed_peer_deps:
-                        continue
-
-                    scoped_key = (peer_name, module_id, package_name_text, version)
-                    if scoped_key in scoped_exceptions:
-                        used_scoped_exceptions.add(scoped_key)
-                        continue
-
-                    reason_hint = ""
-                    if peer_name in {item[0] for item in scoped_exceptions.keys()}:
-                        reason_hint = (
-                            " Add or update a scopedPeerDependencyExceptions entry "
-                            "if this is an intentional temporary compatibility case."
-                        )
-
-                    if peer_name not in allowed_peer_deps:
-                        errors.append(
-                            build_error(
-                                ERROR_PEER_DEP_UNKNOWN,
-                                f"Module '{module_id}' version '{version}' has unsupported "
-                                f"peer dependency '{peer_name}' (package: '{package_name_text}')."
-                                f"{reason_hint}",
-                            )
-                        )
-
-    stale_exceptions = sorted(set(scoped_exceptions.keys()) - used_scoped_exceptions)
-    for name, module_id, package_name_text, version in stale_exceptions:
-        errors.append(
-            build_error(
-                ERROR_PEER_DEP_ALLOWLIST_INVALID,
-                f"Scoped exception for '{name}' on module '{module_id}' version '{version}' "
-                f"(package: '{package_name_text}') is stale and should be removed.",
-            )
-        )
 
     if errors:
         details = "\n".join(f"  - {err}" for err in errors)
@@ -982,8 +810,7 @@ def write_index_artifacts(index_dir: Path, payload: dict[str, Any]) -> tuple[Pat
 
 def build() -> None:
     modules, module_version_major_map = collect_modules()
-    allowed_peer_deps, scoped_exceptions = load_peer_dependency_allowlist()
-    validate_runtime_contracts(modules, allowed_peer_deps, scoped_exceptions)
+    validate_runtime_contracts(modules)
     generated_at = utc_now_iso()
 
     if DIST_ROOT.is_symlink():
