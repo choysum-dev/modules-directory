@@ -669,6 +669,7 @@ def verify_tarball_integrity(
                 try:
                     temp_cache_file.unlink()
                 except OSError:
+                    # Temp cache cleanup is best-effort; deletion failure is non-fatal.
                     pass
 
 
