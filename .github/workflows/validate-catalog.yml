@@ -23,7 +23,7 @@ jobs:
       CHOYSUM_TARBALL_MAX_BYTES: "52428800"
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Python
         uses: actions/setup-python@v6
