@@ -38,3 +38,18 @@ jobs:
         with:
           name: dist
           path: dist
+
+      - name: Trigger Cloudflare Pages rebuild
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        env:
+          CLOUDFLARE_PAGES_BUILD_HOOK_URL: ${{ secrets.CLOUDFLARE_PAGES_BUILD_HOOK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_PAGES_BUILD_HOOK_URL}" ]; then
+            echo "::error::Missing secret CLOUDFLARE_PAGES_BUILD_HOOK_URL. Configure a Cloudflare Pages build hook URL to trigger scheduled rebuilds."
+            exit 1
+          fi
+
+          curl --fail --show-error --silent \
+            --request POST \
+            "${CLOUDFLARE_PAGES_BUILD_HOOK_URL}"
